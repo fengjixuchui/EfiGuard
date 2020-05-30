@@ -14,7 +14,7 @@
 KERNEL_PATCH_INFORMATION gKernelPatchInfo;
 
 
-// Signature for ntoskrnl!KeInitAmd64SpecificState
+// Signature for nt!KeInitAmd64SpecificState
 // This function is present in all x64 kernels since Vista. It generates a #DE due to 32 bit idiv quotient overflow.
 STATIC CONST UINT8 SigKeInitAmd64SpecificState[] = {
 	0xF7, 0xD9,					// neg ecx
@@ -27,7 +27,37 @@ STATIC CONST UINT8 SigKeInitAmd64SpecificState[] = {
 	0x41, 0xF7, 0xF8			// idiv r8d
 };
 
-// Signature for SeCodeIntegrityQueryInformation, called through NtQuerySystemInformation(SystemCodeIntegrityInformation).
+// Signature for nt!KiVerifyScopesExecute
+// This function is present since Windows 8.1 and is responsible for executing all functions in the KiVerifyXcptRoutines array.
+// One of these functions, KiVerifyXcpt15, will indirectly initialize a PatchGuard context from its exception handler.
+STATIC CONST UINT8 SigKiVerifyScopesExecute[] = {
+	0x48, 0x83, 0xCC, 0xCC, 0x00,								// and [REG+XX], 0
+	0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE	// mov rax, 0FEFFFFFFFFFFFFFFh
+};
+
+// Signature for nt!KiMcaDeferredRecoveryService
+// This function is present since Windows 8.1 and bugchecks the system with bugcode 0x109 after zeroing registers.
+// It is called by KiScanQueues and KiSchedulerDpc, two PatchGuard DPCs which may be queued from various unrelated kernel functions.
+STATIC CONST UINT8 SigKiMcaDeferredRecoveryService[] = {
+	0x33, 0xC0,												// xor eax, eax
+	0x8B, 0xD8,												// mov ebx, eax
+	0x8B, 0xF8,												// mov edi, eax
+	0x8B, 0xE8,												// mov ebp, eax
+	0x4C, 0x8B, 0xD0										// mov r10, rax
+};
+
+// Signature for nt!KiSwInterrupt
+// This function is present since Windows 10 and is the interrupt handler for int 20h.
+// This interrupt is a spurious interrupt on older versions of Windows, and does nothing useful on Windows 10.
+// If int 20h is issued from kernel mode, the PatchGuard verification routine KiSwInterruptDispatch is called.
+STATIC CONST UINT8 SigKiSwInterrupt[] = {
+	0xFB,													// sti
+	0x48, 0x8D, 0xCC, 0xCC,									// lea rcx, XX
+	0xE8, 0xCC, 0xCC, 0xCC, 0xCC,							// call KiSwInterruptDispatch
+	0xFA													// cli
+};
+
+// Signature for nt!SeCodeIntegrityQueryInformation, called through NtQuerySystemInformation(SystemCodeIntegrityInformation).
 // This function has actually existed since Vista in various forms, sometimes (8/8.1/early 10) inlined in ExpQuerySystemInformation.
 // This signature is only for the Windows 10 RS3+ version. I could add more signatures but this is a pretty superficial patch anyway.
 STATIC CONST UINT8 SigSeCodeIntegrityQueryInformation[] = {
@@ -49,7 +79,7 @@ STATIC CONST UINT8 SeCodeIntegrityQueryInformationPatch[] = {
 
 //
 // Defuses PatchGuard initialization routines before execution is transferred to the kernel.
-// All code accessed here is located in the INIT section.
+// All code accessed here is located in the INIT and .text sections.
 //
 STATIC
 EFI_STATUS
@@ -58,12 +88,13 @@ DisablePatchGuard(
 	IN UINT8* ImageBase,
 	IN PEFI_IMAGE_NT_HEADERS NtHeaders,
 	IN PEFI_IMAGE_SECTION_HEADER InitSection,
+	IN PEFI_IMAGE_SECTION_HEADER TextSection,
 	IN UINT16 BuildNumber
 	)
 {
-	CONST UINT32 StartRva = InitSection->VirtualAddress;
-	CONST UINT32 SizeOfRawData = InitSection->SizeOfRawData;
-	CONST UINT8* StartVa = ImageBase + StartRva;
+	UINT32 StartRva = InitSection->VirtualAddress;
+	UINT32 SizeOfRawData = InitSection->SizeOfRawData;
+	UINT8* StartVa = ImageBase + StartRva;
 
 	// Search for KeInitAmd64SpecificState
 	PRINT_KERNEL_PATCH_MSG(L"\r\n== Searching for nt!KeInitAmd64SpecificState pattern in INIT ==\r\n");
@@ -116,7 +147,7 @@ DisablePatchGuard(
 		return EFI_LOAD_ERROR;
 	}
 
-	CONST UINTN Length = SizeOfRawData;
+	UINTN Length = SizeOfRawData;
 	UINTN Offset = 0;
 	ZyanU64 InstructionAddress;
 	ZydisDecodedInstruction Instruction;
@@ -228,6 +259,133 @@ DisablePatchGuard(
 		}
 	}
 
+	// Search for KiVerifyScopesExecute (only exists on Windows >= 8.1)
+	UINT8* KiVerifyScopesExecute = NULL;
+	if (BuildNumber >= 9600)
+	{
+		PRINT_KERNEL_PATCH_MSG(L"== Searching for nt!KiVerifyScopesExecute pattern in INIT ==\r\n");
+		UINT8* KiVerifyScopesExecutePatternAddress = NULL;
+		CONST EFI_STATUS FindKiVerifyScopesExecuteStatus = FindPattern(SigKiVerifyScopesExecute,
+																	0xCC,
+																	sizeof(SigKiVerifyScopesExecute),
+																	(VOID*)StartVa,
+																	SizeOfRawData,
+																	(VOID**)&KiVerifyScopesExecutePatternAddress);
+		if (EFI_ERROR(FindKiVerifyScopesExecuteStatus))
+		{
+			PRINT_KERNEL_PATCH_MSG(L"    Failed to find KiVerifyScopesExecute pattern.\r\n");
+			return EFI_NOT_FOUND;
+		}
+		PRINT_KERNEL_PATCH_MSG(L"    Found KiVerifyScopesExecute pattern at 0x%llX.\r\n", (UINTN)KiVerifyScopesExecutePatternAddress);
+
+		// Backtrack to function start
+		KiVerifyScopesExecute = BacktrackToFunctionStart(KiVerifyScopesExecutePatternAddress,
+			(UINT8*)(KiVerifyScopesExecutePatternAddress - StartVa));
+		if (KiVerifyScopesExecute == NULL)
+		{
+			PRINT_KERNEL_PATCH_MSG(L"    Failed to find KiVerifyScopesExecute.\r\n");
+			return EFI_NOT_FOUND;
+		}
+	}
+
+	// Search for callers of KiMcaDeferredRecoveryService (only exists on Windows >= 8.1)
+	UINT8* KiMcaDeferredRecoveryServiceCallers[2];
+	ZeroMem(KiMcaDeferredRecoveryServiceCallers, sizeof(KiMcaDeferredRecoveryServiceCallers));
+	if (BuildNumber >= 9600)
+	{
+		StartRva = TextSection->VirtualAddress;
+		SizeOfRawData = TextSection->SizeOfRawData;
+		StartVa = ImageBase + StartRva;
+
+		// Search for KiMcaDeferredRecoveryService
+		PRINT_KERNEL_PATCH_MSG(L"== Searching for nt!KiMcaDeferredRecoveryService pattern in .text ==\r\n");
+		UINT8* KiMcaDeferredRecoveryService = NULL;
+		for (UINT8* Address = (UINT8*)StartVa; Address < StartVa + SizeOfRawData - sizeof(SigKiMcaDeferredRecoveryService); ++Address)
+		{
+			if (CompareMem(Address, SigKiMcaDeferredRecoveryService, sizeof(SigKiMcaDeferredRecoveryService)) == 0)
+			{
+				KiMcaDeferredRecoveryService = Address;
+				PRINT_KERNEL_PATCH_MSG(L"    Found KiMcaDeferredRecoveryService pattern at 0x%llX.\r\n", (UINTN)KiMcaDeferredRecoveryService);
+				break;
+			}
+		}
+
+		if (KiMcaDeferredRecoveryService == NULL)
+		{
+			PRINT_KERNEL_PATCH_MSG(L"    Failed to find KiMcaDeferredRecoveryService.\r\n");
+			return EFI_NOT_FOUND;
+		}
+
+		// Start decode loop
+		Length = SizeOfRawData;
+		Offset = 0;
+		while ((InstructionAddress = (ZyanU64)(StartVa + Offset),
+				Status = ZydisDecoderDecodeBuffer(&Decoder,
+												(VOID*)InstructionAddress,
+												Length - Offset,
+												&Instruction)) != ZYDIS_STATUS_NO_MORE_DATA)
+		{
+			if (!ZYAN_SUCCESS(Status))
+			{
+				Offset++;
+				continue;
+			}
+
+			// Check if this is 'call KiMcaDeferredRecoveryService'
+			ZyanU64 OperandAddress = 0;	
+			if (Instruction.mnemonic == ZYDIS_MNEMONIC_CALL &&
+				ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&Instruction, &Instruction.operands[0], InstructionAddress, &OperandAddress)) &&
+				OperandAddress == (UINTN)KiMcaDeferredRecoveryService)
+			{
+				if (KiMcaDeferredRecoveryServiceCallers[0] == NULL)
+				{
+					KiMcaDeferredRecoveryServiceCallers[0] = (UINT8*)InstructionAddress;
+				}
+				else if (KiMcaDeferredRecoveryServiceCallers[1] == NULL)
+				{
+					KiMcaDeferredRecoveryServiceCallers[1] = (UINT8*)InstructionAddress;
+					break;
+				}
+			}
+
+			Offset += Instruction.length;
+		}
+
+		// Backtrack to function start
+		KiMcaDeferredRecoveryServiceCallers[0] = BacktrackToFunctionStart(KiMcaDeferredRecoveryServiceCallers[0],
+			(UINT8*)(KiMcaDeferredRecoveryServiceCallers[0] - StartVa));
+		KiMcaDeferredRecoveryServiceCallers[1] = BacktrackToFunctionStart(KiMcaDeferredRecoveryServiceCallers[1],
+			(UINT8*)(KiMcaDeferredRecoveryServiceCallers[1] - StartVa));
+		if (KiMcaDeferredRecoveryServiceCallers[0] == NULL || KiMcaDeferredRecoveryServiceCallers[1] == NULL)
+		{
+			PRINT_KERNEL_PATCH_MSG(L"    Failed to find KiMcaDeferredRecoveryService callers.\r\n");
+			return EFI_NOT_FOUND;
+		}
+	}
+
+	// Search for KiSwInterrupt (only exists on Windows >= 10)
+	UINT8* KiSwInterruptPatternAddress = NULL;
+	if (BuildNumber >= 10240)
+	{
+		PRINT_KERNEL_PATCH_MSG(L"== Searching for nt!KiSwInterrupt pattern in .text ==\r\n");
+		CONST EFI_STATUS FindKiSwInterruptStatus = FindPattern(SigKiSwInterrupt,
+																0xCC,
+																sizeof(SigKiSwInterrupt),
+																(VOID*)StartVa,
+																SizeOfRawData,
+																(VOID**)&KiSwInterruptPatternAddress);
+		if (EFI_ERROR(FindKiSwInterruptStatus))
+		{
+			// This is not a fatal error as the system can still boot without patching KiSwInterrupt.
+			// However note that in this case, any attempt to issue int 20h from kernel mode later will result in a bugcheck.
+			PRINT_KERNEL_PATCH_MSG(L"    Failed to find KiSwInterrupt. Skipping patch.\r\n");
+		}
+		else
+		{
+			PRINT_KERNEL_PATCH_MSG(L"    Found KiSwInterrupt pattern at 0x%llX.\r\n", (UINTN)KiSwInterruptPatternAddress);
+		}
+	}
+
 	// We have all the addresses we need; now do the actual patching.
 	CONST UINT32 Yes = 0xC301B0;	// mov al, 1, ret
 	CONST UINT32 No = 0xC3C033;		// xor eax, eax, ret
@@ -235,6 +393,15 @@ DisablePatchGuard(
 	*((UINT32*)CcInitializeBcbProfiler) = Yes;
 	if (ExpLicenseWatchInitWorker != NULL)
 		*((UINT32*)ExpLicenseWatchInitWorker) = No;
+	if (KiVerifyScopesExecute != NULL)
+		*(UINT32*)KiVerifyScopesExecute = No;
+	if (KiMcaDeferredRecoveryServiceCallers[0] != NULL && KiMcaDeferredRecoveryServiceCallers[1] != NULL)
+	{
+		*(UINT32*)KiMcaDeferredRecoveryServiceCallers[0] = No;
+		*(UINT32*)KiMcaDeferredRecoveryServiceCallers[1] = No;
+	}
+	if (KiSwInterruptPatternAddress != NULL)
+		SetMem(KiSwInterruptPatternAddress, sizeof(SigKiSwInterrupt), 0x90); // 11 x nop
 
 	// Print info
 	PRINT_KERNEL_PATCH_MSG(L"\r\n    Patched KeInitAmd64SpecificState [RVA: 0x%X].\r\n",
@@ -245,6 +412,22 @@ DisablePatchGuard(
 	{
 		PRINT_KERNEL_PATCH_MSG(L"    Patched ExpLicenseWatchInitWorker [RVA: 0x%X].\r\n",
 			(UINT32)(ExpLicenseWatchInitWorker - ImageBase));
+	}
+	if (KiVerifyScopesExecute != NULL)
+	{
+		PRINT_KERNEL_PATCH_MSG(L"    Patched KiVerifyScopesExecute [RVA: 0x%X].\r\n",
+			(UINT32)(KiVerifyScopesExecute - ImageBase));
+	}
+	if (KiMcaDeferredRecoveryServiceCallers[0] != NULL && KiMcaDeferredRecoveryServiceCallers[1] != NULL)
+	{
+		PRINT_KERNEL_PATCH_MSG(L"    Patched KiMcaDeferredRecoveryService [RVAs: 0x%X, 0x%X].\r\n",
+			(UINT32)(KiMcaDeferredRecoveryServiceCallers[0] - ImageBase),
+			(UINT32)(KiMcaDeferredRecoveryServiceCallers[1] - ImageBase));
+	}
+	if (KiSwInterruptPatternAddress != NULL)
+	{
+		PRINT_KERNEL_PATCH_MSG(L"    Patched KiSwInterrupt [RVA: 0x%X].\r\n",
+			(UINT32)(KiSwInterruptPatternAddress - ImageBase));
 	}
 
 	return EFI_SUCCESS;
@@ -259,6 +442,7 @@ DisablePatchGuard(
 //
 STATIC
 EFI_STATUS
+EFIAPI
 DisableDSE(
 	IN UINT8* ImageBase,
 	IN PEFI_IMAGE_NT_HEADERS NtHeaders,
@@ -601,7 +785,7 @@ PatchNtoskrnl(
 	}
 
 	// Find the INIT and PAGE sections
-	PEFI_IMAGE_SECTION_HEADER InitSection = NULL, PageSection = NULL;
+	PEFI_IMAGE_SECTION_HEADER InitSection = NULL, TextSection = NULL, PageSection = NULL;
 	PEFI_IMAGE_SECTION_HEADER Section = IMAGE_FIRST_SECTION(NtHeaders);
 	for (UINT16 i = 0; i < NtHeaders->FileHeader.NumberOfSections; ++i)
 	{
@@ -611,6 +795,8 @@ PatchNtoskrnl(
 
 		if (AsciiStrCmp(SectionName, "INIT") == 0)
 			InitSection = Section;
+		else if (AsciiStrCmp(SectionName, ".text") == 0)
+			TextSection = Section;
 		else if (AsciiStrCmp(SectionName, "PAGE") == 0)
 			PageSection = Section;
 
@@ -618,14 +804,16 @@ PatchNtoskrnl(
 	}
 
 	ASSERT(InitSection != NULL);
+	ASSERT(TextSection != NULL);
 	ASSERT(PageSection != NULL);
 
-	// Patch INIT section to disable PatchGuard
+	// Patch INIT and .text sections to disable PatchGuard
 	PRINT_KERNEL_PATCH_MSG(L"[PatchNtoskrnl] Disabling PatchGuard... [INIT RVA: 0x%X - 0x%X]\r\n",
 		InitSection->VirtualAddress, InitSection->VirtualAddress + InitSection->SizeOfRawData);
 	Status = DisablePatchGuard((UINT8*)ImageBase,
 								NtHeaders,
 								InitSection,
+								TextSection,
 								BuildNumber);
 	if (EFI_ERROR(Status))
 		return Status;
