@@ -75,7 +75,7 @@ static
 LONG
 QueryCiOptions(
 	_In_ PVOID MappedBase,
-	_In_ ULONG_PTR KernelBase,
+	_In_ ULONG_PTR CiDllBase,
 	_Out_ PULONG_PTR gCiOptionsAddress
 	)
 {
@@ -85,7 +85,11 @@ QueryCiOptions(
 	LONG Relative = 0;
 	hde64s hs;
 
-	const PUCHAR CiInitialize = reinterpret_cast<PUCHAR>(GetProcedureAddress(reinterpret_cast<ULONG_PTR>(MappedBase), "CiInitialize"));
+	const PIMAGE_NT_HEADERS NtHeaders = RtlImageNtHeader(MappedBase);
+	if (NtHeaders == nullptr)
+		return 0;
+
+	const PUCHAR CiInitialize = static_cast<PUCHAR>(GetProcedureAddress(reinterpret_cast<ULONG_PTR>(MappedBase), "CiInitialize"));
 	if (CiInitialize == nullptr)
 		return 0;
 
@@ -95,19 +99,28 @@ QueryCiOptions(
 		ULONG j = 0;
 		do
 		{
-			// call CipInitialize
-			if (CiInitialize[i] == 0xE8)
-				j++;
-
-			if (j > 1)
-			{
-				Relative = *reinterpret_cast<PLONG>(CiInitialize + i + 1);
-				break;
-			}
-
 			hde64_disasm(CiInitialize + i, &hs);
 			if (hs.flags & F_ERROR)
 				break;
+
+			// call CipInitialize
+			const BOOLEAN IsCall = hs.len == 5 && CiInitialize[i] == 0xE8;
+			if (IsCall)
+				j++;
+
+			if (IsCall && j > 1)
+			{
+				Relative = *reinterpret_cast<PLONG>(CiInitialize + i + 1);
+
+				// Check the call target to skip calls to __security_init_cookie, wil_InitializeFeatureStaging, and other stuff in INIT. CipInitialize is in PAGE.
+				const PUCHAR CallTarget = CiInitialize + i + hs.len + Relative;
+				if (AddressIsInSection(static_cast<PUCHAR>(MappedBase), CallTarget, NtHeaders, "PAGE"))
+				{
+					break;
+				}
+				Relative = 0;
+			}
+
 			i += hs.len;
 
 		} while (i < 256);
@@ -117,39 +130,54 @@ QueryCiOptions(
 		i = 0;
 		do
 		{
+			hde64_disasm(CiInitialize + i, &hs);
+			if (hs.flags & F_ERROR)
+				break;
+
 			// jmp CipInitialize
-			if (CiInitialize[i] == 0xE9)
+			if (hs.len == 5 && CiInitialize[i] == 0xE9)
 			{
 				Relative = *reinterpret_cast<PLONG>(CiInitialize + i + 1);
 				break;
 			}
-			hde64_disasm(CiInitialize + i, &hs);
-			if (hs.flags & F_ERROR)
-				break;
+
 			i += hs.len;
 
 		} while (i < 256);
 	}
 
-	const PUCHAR CipInitialize = CiInitialize + i + 5 + Relative;
+	if (Relative == 0)
+		return 0;
+
+	const PUCHAR CipInitialize = CiInitialize + i + hs.len + Relative;
+	if (!AddressIsInSection(static_cast<PUCHAR>(MappedBase), CipInitialize, NtHeaders, "PAGE"))
+		return 0;
+
 	i = 0;
 	do
 	{
-		if (*reinterpret_cast<PUSHORT>(CipInitialize + i) == 0x0d89)
+		hde64_disasm(CipInitialize + i, &hs);
+		if (hs.flags & F_ERROR)
+			break;
+
+		if (hs.len == 6 && *reinterpret_cast<PUSHORT>(CipInitialize + i) == 0x0d89) // mov g_CiOptions, ecx
 		{
 			Relative = *reinterpret_cast<PLONG>(CipInitialize + i + 2);
 			break;
 		}
-		hde64_disasm(CipInitialize + i, &hs);
-		if (hs.flags & F_ERROR)
-			break;
+
 		i += hs.len;
 
 	} while (i < 256);
 
-	const PUCHAR MappedCiOptions = CipInitialize + i + 6 + Relative;
+	const PUCHAR MappedCiOptions = CipInitialize + i + hs.len + Relative;
 
-	*gCiOptionsAddress = KernelBase + MappedCiOptions - static_cast<PUCHAR>(MappedBase);
+	// g_CiOptions is in .data or (newer builds) "CiPolicy"
+	if (!AddressIsInSection(static_cast<PUCHAR>(MappedBase), MappedCiOptions, NtHeaders, ".data") &&
+		!AddressIsInSection(static_cast<PUCHAR>(MappedBase), MappedCiOptions, NtHeaders, "CiPolicy"))
+		return 0;
+
+	*gCiOptionsAddress = CiDllBase + MappedCiOptions - static_cast<PUCHAR>(MappedBase);
 
 	return Relative;
 }
